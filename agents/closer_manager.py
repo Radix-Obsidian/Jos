@@ -1,13 +1,18 @@
 """Closer Manager - detect hot leads, generate closing scripts, book meetings.
 
+Uses local LLM (MLX) for personalized closing with template fallback.
 Enhanced closer with hot-lead detection and closing script generation.
 """
 from __future__ import annotations
 
-import requests as http_requests
+import logging
+from urllib.parse import urlencode
 
 import ledger
 from config import PRODUCT
+from llm import generate_with_fallback, build_closing_prompt, SYSTEM_CLOSER
+
+logger = logging.getLogger("joy.closer")
 
 
 def close_deal(lead: dict, tier: str) -> dict:
@@ -62,21 +67,13 @@ def is_hot_lead(lead: dict, score: float, status: str) -> bool:
 
 
 def generate_closing_script(lead: dict, tier: str, action: str) -> str:
-    """Generate a closing script/message for the lead.
-
-    Args:
-        lead: Lead dict
-        tier: Lead tier
-        action: Close action (book_demo/payment_link/none)
-
-    Returns:
-        Closing script text
-    """
-    first_name = lead["name"].split()[0]
+    """Generate a closing script/message using LLM with template fallback."""
+    first_name = lead["name"].split()[0] if lead.get("name") else "there"
     company = lead.get("company", "your team")
 
+    # Template fallback (original logic)
     if action == "book_demo":
-        script = (
+        fallback = (
             f"Hi {first_name},\n\n"
             f"I'd love to show you exactly how {PRODUCT['name']} can help "
             f"{company} ship voice features faster.\n\n"
@@ -86,7 +83,7 @@ def generate_closing_script(lead: dict, tier: str, action: str) -> str:
             f"Best,\nJoy\nVoco V2 Team"
         )
     elif action == "payment_link":
-        script = (
+        fallback = (
             f"Hey {first_name},\n\n"
             f"Ready to get started? {PRODUCT['name']} is available at "
             f"{PRODUCT['price_self_serve']} with everything you need.\n\n"
@@ -95,37 +92,40 @@ def generate_closing_script(lead: dict, tier: str, action: str) -> str:
             f"Best,\nJoy\nVoco V2 Team"
         )
     else:
-        script = ""
+        return ""
+
+    # LLM generation
+    prompt = build_closing_prompt(lead, tier, action)
+    script = generate_with_fallback(prompt, SYSTEM_CLOSER, fallback)
 
     if script:
-        ledger.log(f"Closing script generated for {lead['name']} ({action})")
+        ledger.log(f"Closing script generated for {lead.get('name', '?')} ({action})")
 
     return script
 
 
 def book_demo(lead: dict) -> dict:
-    """Book a demo call via Calendly API."""
+    """Generate a personalized Calendly booking link for the lead.
+
+    Creates a pre-filled Calendly URL with lead details so they can
+    self-schedule. Does NOT make an API call — Calendly handles the form.
+    """
     try:
-        resp = http_requests.post(
-            PRODUCT["demo_url"],
-            json={"name": lead["name"], "email": lead["email"]},
-            timeout=10,
-        )
+        params = urlencode({
+            "name": lead.get("name", ""),
+            "email": lead.get("email", ""),
+        })
+        booking_url = f"{PRODUCT['demo_url']}?{params}"
 
-        if resp.status_code == 200:
-            data = resp.json()
-            ledger.log(f"Demo booked for {lead['name']}: {data.get('url', 'N/A')}")
-            return {
-                "status": "booked",
-                "url": data.get("url", PRODUCT["demo_url"]),
-                "lead": lead["name"],
-            }
-
-        ledger.log(f"Demo booking failed for {lead['name']}: HTTP {resp.status_code}")
-        return {"status": "failed", "error": f"HTTP {resp.status_code}"}
+        ledger.log(f"Demo link generated for {lead['name']}: {booking_url}")
+        return {
+            "status": "link_generated",
+            "url": booking_url,
+            "lead": lead["name"],
+        }
 
     except Exception as e:
-        ledger.log(f"Demo booking error for {lead['name']}: {e}")
+        ledger.log(f"Demo link error for {lead.get('name', '?')}: {e}")
         return {"status": "failed", "error": str(e)}
 
 

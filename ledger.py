@@ -1,15 +1,19 @@
 """Execution ledger - logs every sales pipeline action with timestamps."""
+from __future__ import annotations
 
+import logging
 from datetime import datetime
 
-_ledger = []
+_ledger: list[str] = []
+_logger = logging.getLogger("joy.pipeline")
 
 
 def log(message: str):
-    """Add timestamped entry to ledger and print to console."""
+    """Add timestamped entry to ledger, emit to stdlib logging, and print."""
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     entry = f"[{ts}] {message}"
     _ledger.append(entry)
+    _logger.info(message)
     print(entry)
 
 

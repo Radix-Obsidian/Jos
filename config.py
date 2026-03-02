@@ -2,6 +2,10 @@
 
 User will replace placeholders with real product details.
 """
+from __future__ import annotations
+
+import os
+import logging
 
 # --- Product Info (PLACEHOLDER - user will fill in) ---
 PRODUCT = {
@@ -81,7 +85,33 @@ ICP_KEYWORDS = [
 SMTP = {
     "host": "smtp.gmail.com",
     "port": 587,
-    "username": "",  # User fills in
-    "password": "",  # User fills in
-    "from_email": "joy@voco.ai",
+    "username": os.getenv("SMTP_USERNAME", ""),
+    "password": os.getenv("SMTP_PASSWORD", ""),
+    "from_email": os.getenv("SMTP_FROM", "joy@voco.ai"),
 }
+
+# --- LLM Config ---
+LLM_MODEL = os.getenv("LLM_MODEL", "mlx-community/Llama-3.2-3B-Instruct-4bit")
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "350"))
+
+# --- Dashboard Auth ---
+DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY", "")
+
+# --- Logging ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+
+def validate_config() -> list[str]:
+    """Check config completeness. Returns list of warnings."""
+    warnings = []
+    if not SMTP["username"]:
+        warnings.append("SMTP_USERNAME not set — email sending will fail")
+    if not DASHBOARD_API_KEY:
+        warnings.append("DASHBOARD_API_KEY not set — dashboard has no auth")
+    return warnings

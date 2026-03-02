@@ -1,10 +1,16 @@
 """Auditor - track KPIs and suggest improvements.
 
+Uses local LLM (MLX) for richer KPI analysis with rule-based fallback.
 Tracks: response rate, close rate, delivery stats, pipeline health.
 """
 from __future__ import annotations
 
+import logging
+
 import ledger
+from llm import generate_with_fallback, build_audit_prompt, SYSTEM_AUDITOR
+
+logger = logging.getLogger("joy.auditor")
 
 
 def audit_pipeline(state: dict) -> dict:
@@ -57,23 +63,42 @@ def audit_pipeline(state: dict) -> dict:
 
 def generate_suggestions(tier: str, status: str, score: float,
                          send_result: dict) -> str:
-    """Generate improvement suggestions based on pipeline data.
+    """Generate improvement suggestions using LLM with rule-based fallback.
 
     Returns:
         Suggestion string (empty if none)
     """
-    suggestions = []
+    # Rule-based suggestions (always computed — used as fallback AND context)
+    rule_suggestions = []
 
     if tier == "nurture" and score >= 0.35:
-        suggestions.append("Lead close to self_serve threshold - consider personal touch")
+        rule_suggestions.append("Lead close to self_serve threshold - consider personal touch")
 
     if send_result.get("status") == "failed":
-        suggestions.append("Delivery failed - try alternate channel")
+        rule_suggestions.append("Delivery failed - try alternate channel")
 
     if status == "cold" and tier in ("enterprise", "self_serve"):
-        suggestions.append("Qualified but cold - prioritize follow-up")
+        rule_suggestions.append("Qualified but cold - prioritize follow-up")
 
-    return "; ".join(suggestions)
+    fallback = "; ".join(rule_suggestions)
+
+    # Only invoke LLM if we have meaningful data to analyze
+    if not rule_suggestions:
+        return fallback
+
+    # Build KPI context for LLM
+    kpi_data = {
+        "total_processed": 1,
+        "hot_leads": 1 if status == "hot" else 0,
+        "cold_leads": 1 if status == "cold" else 0,
+        "responded": 1 if status == "responded" else 0,
+        "delivery_rate": 1.0 if send_result.get("status") == "sent" else 0.0,
+        "close_rate": 0.0,
+    }
+
+    prompt = build_audit_prompt(kpi_data, rule_suggestions)
+    result = generate_with_fallback(prompt, SYSTEM_AUDITOR, fallback, max_tokens=150)
+    return result
 
 
 def determine_post_audit_status(current_status: str, send_result: dict) -> str:
@@ -117,7 +142,7 @@ def calculate_batch_kpis(states: list[dict]) -> dict:
     responded = sum(1 for s in states if s.get("lead_status") == "responded")
     sent = sum(1 for s in states if s.get("send_result", {}).get("status") == "sent")
     closed = sum(1 for s in states if s.get("close_action") in ("book_demo", "payment_link")
-                 and s.get("close_result", {}).get("status") in ("booked", "sent"))
+                 and s.get("close_result", {}).get("status") in ("booked", "sent", "link_generated"))
 
     return {
         "total_processed": total,

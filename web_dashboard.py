@@ -1,28 +1,110 @@
-"""Joy V1 Sales Rep — Web Dashboard (Phase 3: Tabs + Approval Queue + Scheduler)."""
+"""Joy V1 Sales Rep — Web Dashboard (Production).
+
+Features:
+- Pipeline result caching (no reprocessing on every page load)
+- Bearer token auth on API routes via DASHBOARD_API_KEY
+- Approve → actually sends email / queues LinkedIn DM
+- Approve engagement → dispatches via x_poster / linkedin_poster
+- KPI snapshots persisted to DB after each pipeline run
+- Simple in-memory rate limiter on API endpoints
+- Full graph invoke on /api/discover (not just hunt)
+"""
+from __future__ import annotations
 
 import atexit
 import asyncio
+import functools
 import json
+import logging
 import time
-from flask import Flask, render_template_string, request, jsonify
+import threading
+from collections import defaultdict
+from datetime import datetime
+
+from flask import Flask, render_template_string, request, jsonify, abort
+
 from agents.outreach_hunter import hunt
-from agents.follow_up_architect import architect_follow_up
+from agents.follow_up_architect import (
+    architect_follow_up, send_message, generate_follow_up_message,
+)
 from agents.closer_manager import close_deal, is_hot_lead
 from agents.auditor import audit_pipeline, calculate_batch_kpis
 from db import (
+    get_connection, upsert_lead, log_outreach, save_kpi_snapshot, get_kpi_counts,
     queue_for_approval, approve_item, reject_item,
     get_pending_approvals, get_approval_counts,
     queue_engagement, get_pending_engagements, get_engagement_stats,
     log_engagement,
 )
+from config import DASHBOARD_API_KEY
 from scheduler import scheduler, get_next_runs
 import ledger
 
+logger = logging.getLogger("joy.dashboard")
+
 app = Flask(__name__)
 
-# Start scheduler (background thread — all scan results go to approval_queue)
+# ---------- Scheduler (background thread) ----------
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown(wait=False))
+
+# ---------- Pipeline Cache ----------
+# Cached results from the last pipeline run — page loads use this instead of
+# re-running the full pipeline on every request.
+_pipeline_cache = {
+    "results": None,
+    "kpis": None,
+    "tier_counts": None,
+    "route_counts": None,
+    "accuracy": None,
+    "elapsed": 0,
+    "timestamp": 0,        # monotonic time of last run
+    "running": False,
+}
+_cache_lock = threading.Lock()
+CACHE_TTL = 300  # 5 minutes
+
+# ---------- Rate Limiter ----------
+_rate_buckets: dict[str, list[float]] = defaultdict(list)
+_rate_lock = threading.Lock()
+RATE_LIMIT = 10          # max requests
+RATE_WINDOW = 60          # per N seconds
+
+
+def _is_rate_limited(key: str) -> bool:
+    """Check if endpoint is rate-limited (10 req/min sliding window)."""
+    now = time.monotonic()
+    with _rate_lock:
+        bucket = _rate_buckets[key]
+        # Evict old entries
+        _rate_buckets[key] = [t for t in bucket if now - t < RATE_WINDOW]
+        if len(_rate_buckets[key]) >= RATE_LIMIT:
+            return True
+        _rate_buckets[key].append(now)
+    return False
+
+
+# ---------- Auth ----------
+
+def require_auth(f):
+    """Decorator: require Bearer token if DASHBOARD_API_KEY is set."""
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if DASHBOARD_API_KEY:
+            auth = request.headers.get("Authorization", "")
+            # Support both header auth and query param for dashboard page
+            token = request.args.get("key", "")
+            if auth == f"Bearer {DASHBOARD_API_KEY}" or token == DASHBOARD_API_KEY:
+                return f(*args, **kwargs)
+            # Allow cookie-based auth for browser
+            if request.cookies.get("joy_auth") == DASHBOARD_API_KEY:
+                return f(*args, **kwargs)
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# ---------- Test Leads ----------
 
 TEST_LEADS = [
     # --- Strong enterprise targets (8) ---
@@ -51,6 +133,8 @@ TEST_LEADS = [
     {"name": "Michael Truell",    "title": "CEO",          "company": "Anysphere",   "email": "michael@anysphere.inc", "linkedin_url": "",                                            "expected_tier": "disqualified"},
 ]
 
+# ---------- HTML Template ----------
+
 HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -75,6 +159,9 @@ HTML = """<!DOCTYPE html>
   .inbox-badge .count { background:#f59e0b; color:#000; border-radius:10px; padding:1px 6px; margin-left:5px; font-size:11px; }
   .next-scan { font-size:11px; color:#666; }
   .next-scan span { color:#aab; }
+  .btn-run { background:#3b82f6; color:#fff; border:none; border-radius:7px; padding:6px 14px; font-size:11px; font-weight:600; cursor:pointer; margin-top:4px; }
+  .btn-run:hover { background:#2563eb; }
+  .btn-run:disabled { opacity:0.5; cursor:not-allowed; }
 
   /* ---- Tabs ---- */
   .tabs { display:flex; gap:0; border-bottom:1px solid #1a1a2e; background:#0d0d1a; padding:0 28px; }
@@ -179,6 +266,11 @@ HTML = """<!DOCTYPE html>
   .acc-counts { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin:12px 0 16px; }
   .acc-count-card { background:#0d0d1a; border:1px solid #1e1e3a; border-radius:6px; padding:10px; text-align:center; }
   .acc-count-val { font-size:22px; font-weight:700; }
+
+  /* Status toast */
+  .toast { position:fixed; bottom:24px; right:24px; background:#22c55e; color:#000; padding:12px 20px; border-radius:8px; font-size:13px; font-weight:600; z-index:1000; opacity:0; transition:opacity 0.3s; }
+  .toast.show { opacity:1; }
+  .toast.error { background:#ef4444; color:#fff; }
 </style>
 </head>
 <body>
@@ -187,7 +279,7 @@ HTML = """<!DOCTYPE html>
 <div class="header">
   <div class="header-left">
     <h1>Joy V1 Sales Rep</h1>
-    <div class="sub">Voco V2 &mdash; Outreach Hunter &bull; Auditor &bull; Closer Manager &bull; Follow-Up Architect &mdash; {{ leads|length }} leads &mdash; async {{ elapsed }}s</div>
+    <div class="sub">Voco V2 &mdash; Outreach Hunter &bull; Auditor &bull; Closer Manager &bull; Follow-Up Architect &mdash; {{ leads|length }} leads &mdash; {% if elapsed %}async {{ elapsed }}s{% else %}cached{% endif %}</div>
     <div class="agents">
       <span class="on">Outreach Hunter</span>
       <span class="on">Auditor</span>
@@ -197,9 +289,10 @@ HTML = """<!DOCTYPE html>
   </div>
   <div class="header-right">
     <div class="inbox-badge" onclick="showTab('inbox')">
-      📬 Inbox<span class="count" id="inbox-count">{{ pending_count }}</span>
+      Inbox<span class="count" id="inbox-count">{{ pending_count }}</span>
     </div>
     <div class="next-scan">Next scan: <span id="next-scan-text">{{ next_scan }}</span></div>
+    <button class="btn-run" id="btn-run-pipeline" onclick="runPipeline()">Run Pipeline</button>
   </div>
 </div>
 
@@ -225,7 +318,7 @@ HTML = """<!DOCTYPE html>
           <span class="tag tag-score">{{ "%.2f"|format(item.lead_score) }}</span>
           <span class="tag" style="background:#1a1a2e;color:#aab;border:1px solid #2a2a4a;">{{ item.channel }}</span>
         </div>
-        <div class="ac-meta">{{ item.lead_email }}{% if item.source == 'cron' %} &bull; 🕐 scheduled{% endif %}</div>
+        <div class="ac-meta">{{ item.lead_email }}{% if item.source == 'cron' %} &bull; scheduled{% endif %}</div>
         <div class="ac-draft-label">Outreach Draft</div>
         <div class="ac-draft">{{ item.outreach_draft }}</div>
         {% if item.follow_up_draft %}
@@ -233,14 +326,14 @@ HTML = """<!DOCTYPE html>
         <div class="ac-followup">{{ item.follow_up_draft }}</div>
         {% endif %}
         <div class="ac-actions">
-          <button class="btn-approve" onclick="reviewItem({{ item.id }}, 'approve')">✓ Approve</button>
-          <button class="btn-reject"  onclick="reviewItem({{ item.id }}, 'reject')">✗ Reject</button>
+          <button class="btn-approve" onclick="approveAndSend({{ item.id }})">Approve &amp; Send</button>
+          <button class="btn-reject"  onclick="reviewItem({{ item.id }}, 'reject')">Reject</button>
         </div>
       </div>
       {% endfor %}
     {% else %}
       <div class="inbox-empty">
-        <div class="icon">📭</div>
+        <div class="icon">No leads pending</div>
         <p>No leads pending review — Joy is watching for new signals.</p>
         <p style="margin-top:8px;font-size:12px;color:#444;">Next scheduled scan: {{ next_scan }}</p>
       </div>
@@ -278,7 +371,7 @@ HTML = """<!DOCTYPE html>
     {% endfor %}
   {% else %}
     <div class="inbox-empty">
-      <div class="icon">💬</div>
+      <div class="icon">No drafts</div>
       <p>No engagement drafts pending — Joy will scan for ICP posts on schedule.</p>
     </div>
   {% endif %}
@@ -312,7 +405,7 @@ HTML = """<!DOCTYPE html>
     </div>
     {% if accuracy.mismatches %}
     <details>
-      <summary>Show {{ accuracy.mismatches|length }} mismatches ▼</summary>
+      <summary>Show {{ accuracy.mismatches|length }} mismatches</summary>
       <div style="margin-top:8px;">
         {% for m in accuracy.mismatches %}
         <div class="mismatch-row">
@@ -334,13 +427,13 @@ HTML = """<!DOCTYPE html>
   <div class="tier-section">
     <div class="tier-label" style="color:#22c55e">Enterprise ({{ enterprise_leads|length }}) <div class="tl-line"></div></div>
     <div class="lead-cards">
-      {% for lead in enterprise_leads %}{% include 'lead_card.html' ignore missing %}
+      {% for lead in enterprise_leads %}
       <div class="lead-card {% if lead.status == 'hot' %}hot-lead{% endif %}">
         <div class="lead-name">
           {{ lead.name }}
           {% if lead.x_username %}<span style="color:#1d9bf0;font-size:11px;">@{{ lead.x_username }}</span>{% endif %}
-          {% if lead.email_confidence >= 80 %}<span class="badge-v">✓ verified</span>{% endif %}
-          {% if lead.expected_tier %}{% if lead.tier_match %}<span class="acc-ok">✓</span>{% else %}<span class="acc-bad">✗ {{ lead.expected_tier }}</span>{% endif %}{% endif %}
+          {% if lead.email_confidence >= 80 %}<span class="badge-v">verified</span>{% endif %}
+          {% if lead.expected_tier %}{% if lead.tier_match %}<span class="acc-ok">OK</span>{% else %}<span class="acc-bad">{{ lead.expected_tier }}</span>{% endif %}{% endif %}
         </div>
         <div class="lead-meta">{{ lead.title }} at {{ lead.company }}{% if lead.email %} &mdash; {{ lead.email }}{% endif %}</div>
         <div class="lead-tags">
@@ -348,20 +441,20 @@ HTML = """<!DOCTYPE html>
           <span class="tag tag-score">{{ "%.2f"|format(lead.score) }}</span>
           {% if lead.channel %}<span class="tag tag-score">{{ lead.channel }}</span>{% endif %}
         </div>
-        {% if lead.status == 'hot' %}<div class="route-label closing">🔥 Routing to Closer</div>
-        {% else %}<div class="route-label followup">📬 Queued for Follow-Up</div>{% endif %}
+        {% if lead.status == 'hot' %}<div class="route-label closing">Routing to Closer</div>
+        {% else %}<div class="route-label followup">Queued for Follow-Up</div>{% endif %}
         {% if lead.x_post_text %}<div class="x-post">{{ lead.x_post_text }}</div>{% endif %}
         {% if lead.dm_preview %}
         <div class="dm-wrap">
           <div class="dm-preview" id="dm-{{ loop.index }}-e">{{ lead.dm_preview }}</div>
-          <span class="dm-expand" onclick="expandDm('dm-{{ loop.index }}-e',this)">▼ expand</span>
+          <span class="dm-expand" onclick="expandDm('dm-{{ loop.index }}-e',this)">expand</span>
         </div>
         {% endif %}
         {% if lead.follow_up_preview %}
         <div class="fup-label">Follow-Up Step 1</div>
         <div class="follow-up-preview">{{ lead.follow_up_preview }}</div>
         {% endif %}
-        {% if lead.suggestion %}<div class="suggestion-box">💡 {{ lead.suggestion }}</div>{% endif %}
+        {% if lead.suggestion %}<div class="suggestion-box">{{ lead.suggestion }}</div>{% endif %}
       </div>
       {% endfor %}
     </div>
@@ -379,8 +472,8 @@ HTML = """<!DOCTYPE html>
         <div class="lead-name">
           {{ lead.name }}
           {% if lead.x_username %}<span style="color:#1d9bf0;font-size:11px;">@{{ lead.x_username }}</span>{% endif %}
-          {% if lead.email_confidence >= 80 %}<span class="badge-v">✓ verified</span>{% endif %}
-          {% if lead.expected_tier %}{% if lead.tier_match %}<span class="acc-ok">✓</span>{% else %}<span class="acc-bad">✗ {{ lead.expected_tier }}</span>{% endif %}{% endif %}
+          {% if lead.email_confidence >= 80 %}<span class="badge-v">verified</span>{% endif %}
+          {% if lead.expected_tier %}{% if lead.tier_match %}<span class="acc-ok">OK</span>{% else %}<span class="acc-bad">{{ lead.expected_tier }}</span>{% endif %}{% endif %}
         </div>
         <div class="lead-meta">{{ lead.title }} at {{ lead.company }}{% if lead.email %} &mdash; {{ lead.email }}{% endif %}</div>
         <div class="lead-tags">
@@ -388,18 +481,18 @@ HTML = """<!DOCTYPE html>
           <span class="tag tag-score">{{ "%.2f"|format(lead.score) }}</span>
           {% if lead.channel %}<span class="tag tag-score">{{ lead.channel }}</span>{% endif %}
         </div>
-        <div class="route-label followup">📬 Queued for Follow-Up</div>
+        <div class="route-label followup">Queued for Follow-Up</div>
         {% if lead.dm_preview %}
         <div class="dm-wrap">
           <div class="dm-preview" id="dm-{{ loop.index }}-s">{{ lead.dm_preview }}</div>
-          <span class="dm-expand" onclick="expandDm('dm-{{ loop.index }}-s',this)">▼ expand</span>
+          <span class="dm-expand" onclick="expandDm('dm-{{ loop.index }}-s',this)">expand</span>
         </div>
         {% endif %}
         {% if lead.follow_up_preview %}
         <div class="fup-label">Follow-Up Step 1</div>
         <div class="follow-up-preview">{{ lead.follow_up_preview }}</div>
         {% endif %}
-        {% if lead.suggestion %}<div class="suggestion-box">💡 {{ lead.suggestion }}</div>{% endif %}
+        {% if lead.suggestion %}<div class="suggestion-box">{{ lead.suggestion }}</div>{% endif %}
       </div>
       {% endfor %}
     </div>
@@ -415,16 +508,16 @@ HTML = """<!DOCTYPE html>
       {% for lead in nurture_leads %}
       <div class="lead-card">
         <div class="lead-name">{{ lead.name }}
-          {% if lead.expected_tier %}{% if lead.tier_match %}<span class="acc-ok">✓</span>{% else %}<span class="acc-bad">✗ {{ lead.expected_tier }}</span>{% endif %}{% endif %}
+          {% if lead.expected_tier %}{% if lead.tier_match %}<span class="acc-ok">OK</span>{% else %}<span class="acc-bad">{{ lead.expected_tier }}</span>{% endif %}{% endif %}
         </div>
         <div class="lead-meta">{{ lead.title }} at {{ lead.company }}</div>
         <div class="lead-tags">
           <span class="tag tag-score">{{ "%.2f"|format(lead.score) }}</span>
           {% if lead.channel %}<span class="tag tag-score">{{ lead.channel }}</span>{% endif %}
         </div>
-        <div class="route-label followup">📬 In nurture sequence</div>
+        <div class="route-label followup">In nurture sequence</div>
         {% if lead.dm_preview %}<div class="dm-preview" style="margin-top:8px;">{{ lead.dm_preview }}</div>{% endif %}
-        {% if lead.suggestion %}<div class="suggestion-box">💡 {{ lead.suggestion }}</div>{% endif %}
+        {% if lead.suggestion %}<div class="suggestion-box">{{ lead.suggestion }}</div>{% endif %}
       </div>
       {% endfor %}
     </div>
@@ -435,12 +528,12 @@ HTML = """<!DOCTYPE html>
   {% set disq_leads = leads | selectattr('tier', 'equalto', 'disqualified') | list %}
   {% if disq_leads %}
   <details>
-    <summary style="color:#6b7280;font-size:13px;padding:10px 0;cursor:pointer;">⛔ Show {{ disq_leads|length }} disqualified leads</summary>
+    <summary style="color:#6b7280;font-size:13px;padding:10px 0;cursor:pointer;">Show {{ disq_leads|length }} disqualified leads</summary>
     <div class="lead-cards" style="margin-top:10px;">
       {% for lead in disq_leads %}
       <div class="lead-card" style="opacity:0.5;">
         <div class="lead-name" style="color:#9ca3af;">{{ lead.name }}
-          {% if lead.expected_tier %}{% if lead.tier_match %}<span class="acc-ok">✓</span>{% else %}<span class="acc-bad">✗ {{ lead.expected_tier }}</span>{% endif %}{% endif %}
+          {% if lead.expected_tier %}{% if lead.tier_match %}<span class="acc-ok">OK</span>{% else %}<span class="acc-bad">{{ lead.expected_tier }}</span>{% endif %}{% endif %}
         </div>
         <div class="lead-meta">{{ lead.title }} at {{ lead.company }}</div>
         <div class="lead-tags"><span class="tag tag-score">{{ "%.2f"|format(lead.score) }}</span></div>
@@ -548,6 +641,9 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Toast notification -->
+<div class="toast" id="toast"></div>
+
 <script>
 function showTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -559,7 +655,14 @@ function showTab(name) {
 function expandDm(id, el) {
   const el2 = document.getElementById(id);
   el2.classList.toggle('dm-expanded');
-  el.textContent = el2.classList.contains('dm-expanded') ? '▲ collapse' : '▼ expand';
+  el.textContent = el2.classList.contains('dm-expanded') ? 'collapse' : 'expand';
+}
+
+function showToast(msg, isError) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (isError ? ' error' : '');
+  setTimeout(() => t.className = 'toast', 3000);
 }
 
 async function reviewItem(id, action) {
@@ -570,16 +673,42 @@ async function reviewItem(id, action) {
   const resp = await fetch('/' + action + '/' + id, {method:'POST'});
   const data = await resp.json();
 
-  if (data.status === action + 'd') {
+  if (data.status === action + 'd' || data.status === 'rejected') {
     card.classList.add('fading');
     setTimeout(() => {
       card.remove();
       updateInboxCount(-1);
       if (!document.querySelector('.approval-card')) {
         document.getElementById('inbox-container').innerHTML =
-          '<div class="inbox-empty"><div class="icon">📭</div><p>All caught up! Joy will surface new leads on the next scan.</p></div>';
+          '<div class="inbox-empty"><div class="icon">All caught up</div><p>Joy will surface new leads on the next scan.</p></div>';
       }
     }, 320);
+    showToast('Item ' + action + 'd', false);
+  }
+}
+
+async function approveAndSend(id) {
+  const card = document.getElementById('card-' + id);
+  const btns = card.querySelectorAll('button');
+  btns.forEach(b => b.classList.add('btn-loading'));
+
+  const resp = await fetch('/approve-send/' + id, {method:'POST'});
+  const data = await resp.json();
+
+  if (data.status === 'sent' || data.status === 'queued' || data.status === 'approved') {
+    card.classList.add('fading');
+    setTimeout(() => {
+      card.remove();
+      updateInboxCount(-1);
+      if (!document.querySelector('.approval-card')) {
+        document.getElementById('inbox-container').innerHTML =
+          '<div class="inbox-empty"><div class="icon">All caught up</div><p>Joy will surface new leads on the next scan.</p></div>';
+      }
+    }, 320);
+    showToast('Approved & ' + (data.send_status || 'sent'), false);
+  } else {
+    btns.forEach(b => b.classList.remove('btn-loading'));
+    showToast('Error: ' + (data.error || 'unknown'), true);
   }
 }
 
@@ -601,9 +730,10 @@ async function executeEngagement(id) {
   if (data.status === 'executed' || data.status === 'approved') {
     card.classList.add('fading');
     setTimeout(() => card.remove(), 320);
+    showToast('Engagement sent', false);
   } else {
     btns.forEach(b => b.classList.remove('btn-loading'));
-    alert('Execution failed: ' + (data.error || 'unknown'));
+    showToast('Failed: ' + (data.error || 'unknown'), true);
   }
 }
 
@@ -615,16 +745,34 @@ async function discoverLeads() {
   const data = await resp.json();
   btn.textContent = 'Discover Leads';
   btn.disabled = false;
-  alert('Discovered ' + (data.count || 0) + ' leads from ' + (data.sources || 0) + ' sources');
-  location.reload();
+  showToast('Discovered ' + (data.count || 0) + ' leads from ' + (data.sources || 0) + ' sources', false);
+  setTimeout(() => location.reload(), 1000);
+}
+
+async function runPipeline() {
+  const btn = document.getElementById('btn-run-pipeline');
+  btn.textContent = 'Running...';
+  btn.disabled = true;
+  const resp = await fetch('/api/run-pipeline', {method:'POST'});
+  const data = await resp.json();
+  btn.textContent = 'Run Pipeline';
+  btn.disabled = false;
+  if (data.status === 'ok') {
+    showToast('Pipeline complete (' + data.elapsed + 's, ' + data.total + ' leads)', false);
+    setTimeout(() => location.reload(), 1000);
+  } else {
+    showToast('Error: ' + (data.error || 'unknown'), true);
+  }
 }
 </script>
 </body>
 </html>"""
 
 
+# ---------- Pipeline Processing ----------
+
 async def process_lead(lead: dict) -> dict:
-    """Async agent: one coroutine per lead — hunt → audit → route → queue for approval."""
+    """Async agent: one coroutine per lead — hunt -> audit -> route -> queue for approval."""
     hunt_result = await asyncio.to_thread(hunt, lead)
     tier = hunt_result["tier"]
     status = hunt_result["status"]
@@ -674,7 +822,7 @@ async def process_lead(lead: dict) -> dict:
             "source": "manual",
         })
 
-    dm_preview = outreach_dm  # full text, expand handled in UI
+    dm_preview = outreach_dm
 
     expected = lead.get("expected_tier", "")
     tier_match = (tier == expected) if expected else None
@@ -738,14 +886,56 @@ async def run_pipeline_async():
                         "actual": r["tier"], "score": r["score"]} for r in mismatches],
     }
 
+    # Persist KPI snapshot to DB
+    try:
+        conn = get_connection()
+        db_kpis = get_kpi_counts(conn)
+        save_kpi_snapshot(conn, db_kpis)
+    except Exception as e:
+        logger.warning("Failed to persist KPI snapshot: %s", e)
+
     return results, kpis, tier_counts, route_counts, accuracy, round(elapsed, 2)
+
+
+def _get_cached_or_run():
+    """Return cached pipeline results, or run if cache is stale/empty.
+
+    First page load triggers a run. Subsequent loads use cache for CACHE_TTL seconds.
+    """
+    with _cache_lock:
+        if _pipeline_cache["results"] is not None and _pipeline_cache["running"] is False:
+            age = time.monotonic() - _pipeline_cache["timestamp"]
+            if age < CACHE_TTL:
+                return (
+                    _pipeline_cache["results"],
+                    _pipeline_cache["kpis"],
+                    _pipeline_cache["tier_counts"],
+                    _pipeline_cache["route_counts"],
+                    _pipeline_cache["accuracy"],
+                    _pipeline_cache["elapsed"],
+                )
+
+    # Cache miss — run pipeline
+    results, kpis, tier_counts, route_counts, accuracy, elapsed = asyncio.run(run_pipeline_async())
+
+    with _cache_lock:
+        _pipeline_cache["results"] = results
+        _pipeline_cache["kpis"] = kpis
+        _pipeline_cache["tier_counts"] = tier_counts
+        _pipeline_cache["route_counts"] = route_counts
+        _pipeline_cache["accuracy"] = accuracy
+        _pipeline_cache["elapsed"] = elapsed
+        _pipeline_cache["timestamp"] = time.monotonic()
+        _pipeline_cache["running"] = False
+
+    return results, kpis, tier_counts, route_counts, accuracy, elapsed
 
 
 # ---------- Flask Routes ----------
 
 @app.route("/")
 def dashboard():
-    results, kpis, tier_counts, route_counts, accuracy, elapsed = asyncio.run(run_pipeline_async())
+    results, kpis, tier_counts, route_counts, accuracy, elapsed = _get_cached_or_run()
     log = ledger.get_log()
 
     # Approval queue data
@@ -761,7 +951,7 @@ def dashboard():
     next_runs = get_next_runs(scheduler, n=10)
     next_scan = next_runs[0]["next_run_pt"] if next_runs else "Not scheduled"
 
-    return render_template_string(
+    resp = render_template_string(
         HTML,
         leads=results,
         kpis=kpis,
@@ -779,37 +969,156 @@ def dashboard():
         engagement_stats=engagement_stats,
     )
 
+    # Set auth cookie if key provided via query param
+    if DASHBOARD_API_KEY and request.args.get("key") == DASHBOARD_API_KEY:
+        from flask import make_response
+        r = make_response(resp)
+        r.set_cookie("joy_auth", DASHBOARD_API_KEY, httponly=True, samesite="Lax", max_age=86400)
+        return r
+
+    return resp
+
+
+@app.route("/approve-send/<int:item_id>", methods=["POST"])
+@require_auth
+def approve_and_send(item_id):
+    """Approve outreach and actually send the email / queue LinkedIn DM.
+
+    This is the key Phase 3 wiring: approve -> send_message -> log_outreach -> update DB.
+    """
+    if _is_rate_limited("approve-send"):
+        return jsonify({"status": "error", "error": "Rate limited"}), 429
+
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM approval_queue WHERE id=?", (item_id,)).fetchone()
+    if not row:
+        return jsonify({"status": "error", "error": "Item not found"}), 404
+
+    item = dict(row)
+
+    # Mark as approved in DB
+    approve_item(item_id)
+
+    # Build lead and message for sending
+    lead = {
+        "name": item["lead_name"],
+        "email": item["lead_email"],
+        "linkedin_url": "",  # Will use email channel primarily
+    }
+    message = {
+        "subject": f"Quick note for {item['lead_name'].split()[0] if item['lead_name'] else 'you'}",
+        "body": item["outreach_draft"],
+    }
+
+    # Parse subject from draft if present (drafts may include "Subject: ...")
+    draft = item["outreach_draft"]
+    if draft.startswith("Subject:"):
+        lines = draft.split("\n", 1)
+        message["subject"] = lines[0].replace("Subject:", "").strip()
+        if len(lines) > 1:
+            message["body"] = lines[1].strip()
+
+    channel = item.get("channel", "email") or "email"
+
+    # Actually send
+    send_result = send_message(lead, message, channel=channel)
+
+    # Persist to outreach_log
+    try:
+        lead_id = upsert_lead(conn, lead, score=item.get("lead_score", 0.0),
+                              tier=item.get("lead_tier", "unknown"))
+        log_outreach(conn, lead_id, channel, "outreach", send_result.get("status", "unknown"))
+    except Exception as e:
+        logger.warning("Failed to log outreach: %s", e)
+
+    return jsonify({
+        "status": send_result.get("status", "sent"),
+        "send_status": send_result.get("status", "sent"),
+        "channel": channel,
+        "id": item_id,
+    })
+
 
 @app.route("/approve/<int:item_id>", methods=["POST"])
+@require_auth
 def approve(item_id):
+    """Mark as approved without sending (legacy endpoint)."""
+    if _is_rate_limited("approve"):
+        return jsonify({"status": "error", "error": "Rate limited"}), 429
     approve_item(item_id)
     return jsonify({"status": "approved", "id": item_id})
 
 
 @app.route("/reject/<int:item_id>", methods=["POST"])
+@require_auth
 def reject(item_id):
+    if _is_rate_limited("reject"):
+        return jsonify({"status": "error", "error": "Rate limited"}), 429
     reject_item(item_id)
     return jsonify({"status": "rejected", "id": item_id})
 
 
 @app.route("/api/pending")
+@require_auth
 def api_pending():
+    if _is_rate_limited("api-pending"):
+        return jsonify({"error": "Rate limited"}), 429
     return jsonify(get_pending_approvals())
 
 
 @app.route("/api/schedule")
+@require_auth
 def api_schedule():
+    if _is_rate_limited("api-schedule"):
+        return jsonify({"error": "Rate limited"}), 429
     return jsonify(get_next_runs(scheduler, n=10))
 
 
+@app.route("/api/run-pipeline", methods=["POST"])
+@require_auth
+def api_run_pipeline():
+    """Explicit trigger to re-run the full pipeline (refreshes cache)."""
+    if _is_rate_limited("run-pipeline"):
+        return jsonify({"status": "error", "error": "Rate limited"}), 429
+
+    try:
+        with _cache_lock:
+            _pipeline_cache["running"] = True
+
+        results, kpis, tier_counts, route_counts, accuracy, elapsed = asyncio.run(run_pipeline_async())
+
+        with _cache_lock:
+            _pipeline_cache["results"] = results
+            _pipeline_cache["kpis"] = kpis
+            _pipeline_cache["tier_counts"] = tier_counts
+            _pipeline_cache["route_counts"] = route_counts
+            _pipeline_cache["accuracy"] = accuracy
+            _pipeline_cache["elapsed"] = elapsed
+            _pipeline_cache["timestamp"] = time.monotonic()
+            _pipeline_cache["running"] = False
+
+        return jsonify({
+            "status": "ok",
+            "total": len(results),
+            "elapsed": elapsed,
+        })
+    except Exception as e:
+        with _cache_lock:
+            _pipeline_cache["running"] = False
+        return jsonify({"status": "error", "error": str(e)})
+
+
 @app.route("/execute/<int:item_id>", methods=["POST"])
+@require_auth
 def execute_engagement(item_id):
     """Approve an engagement item and dispatch it via the appropriate poster."""
-    from db import get_connection
+    if _is_rate_limited("execute"):
+        return jsonify({"status": "error", "error": "Rate limited"}), 429
+
     conn = get_connection()
     row = conn.execute("SELECT * FROM approval_queue WHERE id=?", (item_id,)).fetchone()
     if not row:
-        return jsonify({"status": "error", "error": "Item not found"})
+        return jsonify({"status": "error", "error": "Item not found"}), 404
 
     item = dict(row)
     action_type = item.get("action_type", "")
@@ -862,8 +1171,15 @@ def execute_engagement(item_id):
 
 
 @app.route("/api/discover", methods=["POST"])
+@require_auth
 def api_discover():
-    """On-demand multi-source lead discovery scan."""
+    """On-demand multi-source lead discovery scan.
+
+    Fixed: runs discovered leads through full graph pipeline (not just hunt).
+    """
+    if _is_rate_limited("discover"):
+        return jsonify({"status": "error", "error": "Rate limited"}), 429
+
     try:
         from lead_sources import get_configured_sources, discover_all
         from config import ICP_KEYWORDS
@@ -872,25 +1188,47 @@ def api_discover():
         sources = get_configured_sources()
         leads = discover_all(keyword, limit_per_source=20) if sources else []
 
-        # Run discovered leads through the pipeline
+        # Run discovered leads through the full graph pipeline
+        from graph import sales_graph
+        queued = 0
+
         for lead in leads:
-            if lead.get("name") and (lead.get("email") or lead.get("x_username")):
-                result = hunt(lead)
-                if result.get("tier") != "disqualified" and result.get("personalized_dm"):
-                    enriched = result.get("lead", lead)
+            if not lead.get("name") or not (lead.get("email") or lead.get("x_username")):
+                continue
+
+            try:
+                # Full graph: outreach_hunter -> auditor -> closer/follow-up
+                state = {
+                    "current_lead": lead,
+                    "lead_tier": "",
+                    "lead_status": "cold",
+                    "lead_score": 0.0,
+                    "error": None,
+                }
+                final_state = sales_graph.invoke(state)
+
+                # Queue for approval if not disqualified
+                tier = final_state.get("lead_tier", "disqualified")
+                dm = final_state.get("personalized_dm", "")
+                if tier != "disqualified" and dm:
+                    enriched = final_state.get("current_lead", lead)
                     queue_for_approval({
-                        "lead_name": enriched.get("name", ""),
-                        "lead_email": enriched.get("email", ""),
-                        "lead_tier": result["tier"],
-                        "lead_score": result["score"],
-                        "channel": result.get("channel", ""),
-                        "outreach_draft": result["personalized_dm"],
+                        "lead_name": enriched.get("name", lead.get("name", "")),
+                        "lead_email": enriched.get("email", lead.get("email", "")),
+                        "lead_tier": tier,
+                        "lead_score": final_state.get("lead_score", 0.0),
+                        "channel": final_state.get("channel", ""),
+                        "outreach_draft": dm,
                         "source": lead.get("source", "discovery"),
                     })
+                    queued += 1
+            except Exception as e:
+                logger.warning("Failed to process discovered lead %s: %s", lead.get("name"), e)
 
         return jsonify({
             "status": "ok",
             "count": len(leads),
+            "queued": queued,
             "sources": len(sources),
         })
     except Exception as e:
@@ -898,4 +1236,8 @@ def api_discover():
 
 
 if __name__ == "__main__":
+    from config import validate_config
+    warnings = validate_config()
+    for w in warnings:
+        logger.warning("Config: %s", w)
     app.run(host="0.0.0.0", port=5001, debug=False)

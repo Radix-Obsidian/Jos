@@ -1,10 +1,12 @@
 """Outreach Hunter - scan leads, qualify, and generate personalized DMs.
 
 Combines: lead scanning + qualification + personalized outreach.
+Uses local LLM (MLX) for personalized generation with template fallback.
 Supports two lead sources: web scraping and X/Twitter.
 """
 from __future__ import annotations
 
+import logging
 import re
 import requests
 from bs4 import BeautifulSoup
@@ -14,8 +16,14 @@ from config import (
     PRODUCT, ICP, EMAIL_TEMPLATE, LINKEDIN_TEMPLATE,
     SCORE_ENTERPRISE, SCORE_SELF_SERVE, SCORE_NURTURE, COMPETITORS,
 )
+from llm import (
+    generate_with_fallback, build_outreach_prompt,
+    parse_email_output, SYSTEM_OUTREACH,
+)
 from x_scraper import search_x_leads
 from lead_enricher import enrich_lead, enrich_lead_with_domain, is_email_verified
+
+logger = logging.getLogger("joy.hunter")
 
 
 # ---------- Lead Scanning ----------
@@ -280,14 +288,14 @@ def generate_outreach(lead: dict, tier: str, channel: str = "email") -> dict:
 
 
 def write_email(lead: dict, tier: str) -> dict:
-    """Write personalized email for a lead."""
-    first_name = lead["name"].split()[0]
+    """Write personalized email using LLM with template fallback."""
+    first_name = lead["name"].split()[0] if lead.get("name") else "there"
     company = lead.get("company", "your company")
-
     x_post = lead.get("x_post_text", "")
 
+    # Build template fallback (original logic)
     if tier == "enterprise":
-        subject = f"{first_name}, scaling voice AI at {company}?"
+        fb_subject = f"{first_name}, scaling voice AI at {company}?"
         if x_post:
             opening = f"Saw your post about voice coding — totally agree. {company} is clearly pushing boundaries."
         else:
@@ -299,7 +307,7 @@ def write_email(lead: dict, tier: str) -> dict:
         )
         cta = "Would you be open to a quick 15-min demo this week?"
     else:
-        subject = f"Voice AI for {company} - quick question"
+        fb_subject = f"Voice AI for {company} - quick question"
         if x_post:
             opening = f"Hi {first_name}, saw your post about voice coding and thought this might be relevant."
         else:
@@ -310,23 +318,34 @@ def write_email(lead: dict, tier: str) -> dict:
         )
         cta = f"You can try it here: {PRODUCT['url']} - happy to answer any questions."
 
-    body = EMAIL_TEMPLATE.format(
-        subject=subject,
+    fallback_body = EMAIL_TEMPLATE.format(
+        subject=fb_subject,
         first_name=first_name,
         opening_line=opening,
         value_prop=value_prop,
         cta=cta,
     )
+    fallback = f"Subject: {fb_subject}\n\n{fallback_body}"
 
+    # LLM generation
+    prompt = build_outreach_prompt(lead, tier, "email")
+    raw = generate_with_fallback(prompt, SYSTEM_OUTREACH, fallback)
+
+    parsed = parse_email_output(raw)
+    subject = parsed["subject"] or fb_subject
+    body = parsed["body"] or fallback_body
+
+    logger.debug("Email for %s: LLM=%s", lead.get("name"), raw != fallback)
     return {"subject": subject, "body": body}
 
 
 def write_linkedin(lead: dict, tier: str) -> dict:
-    """Write personalized LinkedIn DM for a lead."""
-    first_name = lead["name"].split()[0]
+    """Write personalized LinkedIn DM using LLM with template fallback."""
+    first_name = lead["name"].split()[0] if lead.get("name") else "there"
     company = lead.get("company", "your team")
     x_post = lead.get("x_post_text", "")
 
+    # Build template fallback (original logic)
     if tier == "enterprise":
         if x_post:
             opening = f"Hi {first_name}, saw your post about voice coding — really resonated."
@@ -342,13 +361,18 @@ def write_linkedin(lead: dict, tier: str) -> dict:
         value_prop = f"{PRODUCT['name']} - voice platform for dev teams, {PRODUCT['price_self_serve']}."
         cta = f"Check it out: {PRODUCT['url']}"
 
-    body = LINKEDIN_TEMPLATE.format(
+    fallback_body = LINKEDIN_TEMPLATE.format(
         first_name=first_name,
         opening_line=opening,
         value_prop=value_prop,
         cta=cta,
     )
 
+    # LLM generation
+    prompt = build_outreach_prompt(lead, tier, "linkedin")
+    body = generate_with_fallback(prompt, SYSTEM_OUTREACH, fallback_body)
+
+    logger.debug("LinkedIn for %s: LLM=%s", lead.get("name"), body != fallback_body)
     return {"body": body}
 
 

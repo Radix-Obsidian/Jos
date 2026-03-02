@@ -1,21 +1,76 @@
-"""SQLite lead tracking database for Joy V1 Sales Rep."""
+"""SQLite lead tracking database for Joy V1 Sales Rep.
+
+Thread-safe connection pooling with WAL mode for concurrent reads.
+"""
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import os
+import threading
 from datetime import datetime
+
+logger = logging.getLogger("joy.db")
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "leads.db")
 
+# Thread-local connection pool — one connection per thread per db_path
+_local = threading.local()
+_initialized_paths: set[str] = set()
+_init_lock = threading.Lock()
+
 
 def get_connection(db_path: str = None) -> sqlite3.Connection:
-    """Get SQLite connection (creates DB + tables if needed)."""
+    """Get thread-local SQLite connection (creates DB + tables on first call).
+
+    Connections are cached per-thread to avoid creating a new one on every call.
+    Tables are initialized once per db_path across all threads.
+    """
     path = db_path or DB_PATH
-    conn = sqlite3.connect(path)
+
+    # Check for cached connection on this thread
+    cache = getattr(_local, "connections", None)
+    if cache is None:
+        cache = {}
+        _local.connections = cache
+
+    conn = cache.get(path)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")  # verify connection is alive
+            return conn
+        except sqlite3.Error:
+            cache.pop(path, None)
+            conn = None
+
+    # Create new connection
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    _init_tables(conn)
+
+    # Enable WAL mode for better concurrent read performance
+    conn.execute("PRAGMA journal_mode=WAL")
+
+    # Initialize tables (once per path, thread-safe)
+    with _init_lock:
+        if path not in _initialized_paths:
+            _init_tables(conn)
+            _initialized_paths.add(path)
+            logger.debug("DB initialized: %s", path)
+
+    cache[path] = conn
     return conn
+
+
+def close_all():
+    """Close all cached connections on the current thread."""
+    cache = getattr(_local, "connections", {})
+    for conn in cache.values():
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+    cache.clear()
 
 
 def _init_tables(conn: sqlite3.Connection):

@@ -89,20 +89,20 @@ def test_closing_script_none():
 # --- Book Demo Tests ---
 
 def test_book_demo_returns_result():
-    with patch("agents.closer_manager.http_requests.post") as mock_post:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {"url": "https://calendly.com/event/abc"}
-        mock_post.return_value = mock_resp
-        result = book_demo(ENTERPRISE_LEAD)
-        assert result["status"] == "booked"
+    """book_demo generates a pre-filled Calendly link (no API call)."""
+    result = book_demo(ENTERPRISE_LEAD)
+    assert result["status"] == "link_generated"
+    assert "name=Sarah" in result["url"]
+    assert "email=sarah" in result["url"]
+    assert "calendly" in result["url"].lower()
 
 
-def test_book_demo_failure():
-    with patch("agents.closer_manager.http_requests.post") as mock_post:
-        mock_post.side_effect = Exception("API down")
-        result = book_demo(ENTERPRISE_LEAD)
-        assert result["status"] == "failed"
+def test_book_demo_with_missing_fields():
+    """book_demo handles leads with missing optional fields."""
+    lead = {"name": "Test", "email": ""}
+    result = book_demo(lead)
+    assert result["status"] == "link_generated"
+    assert "name=Test" in result["url"]
 
 
 # --- Payment Link Tests ---
@@ -116,15 +116,11 @@ def test_send_payment_link():
 # --- Close Deal Tests ---
 
 def test_close_deal_enterprise():
-    with patch("agents.closer_manager.http_requests.post") as mock_post:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {"url": "https://calendly.com/event/abc"}
-        mock_post.return_value = mock_resp
-        result = close_deal(ENTERPRISE_LEAD, tier="enterprise")
-        assert result["action"] == "book_demo"
-        assert result["status"] == "booked"
-        assert "closing_script" in result
+    result = close_deal(ENTERPRISE_LEAD, tier="enterprise")
+    assert result["action"] == "book_demo"
+    assert result["status"] == "link_generated"
+    assert "closing_script" in result
+    assert "calendly" in result["url"].lower()
 
 
 def test_close_deal_self_serve():

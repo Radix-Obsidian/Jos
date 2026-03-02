@@ -1,9 +1,11 @@
 """Follow-Up Architect - track leads and send timed follow-ups.
 
+Uses local LLM (MLX) for step-aware follow-up generation with template fallback.
 Combines: message sending + follow-up scheduling + tracking.
 """
 from __future__ import annotations
 
+import logging
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -11,6 +13,12 @@ from datetime import datetime, timedelta
 
 import ledger
 from config import SMTP, FOLLOW_UP_DAYS, PRODUCT
+from llm import (
+    generate_with_fallback, build_follow_up_prompt,
+    parse_email_output, SYSTEM_FOLLOW_UP,
+)
+
+logger = logging.getLogger("joy.followup")
 
 
 # ---------- Message Sending ----------
@@ -108,17 +116,18 @@ def get_due_follow_ups(queue: list[dict]) -> list[dict]:
 
 
 def generate_follow_up_message(lead: dict, step: int, tier: str) -> dict:
-    """Generate follow-up message based on step number.
+    """Generate follow-up message using LLM with step-aware template fallback.
 
     Returns:
         Dict with subject and body (follow_up_text)
     """
-    first_name = lead["name"].split()[0]
+    first_name = lead["name"].split()[0] if lead.get("name") else "there"
     company = lead.get("company", "your team")
 
+    # Template fallback (original step-based logic)
     if step == 1:
-        subject = f"Following up - {PRODUCT['name']} for {company}"
-        body = (
+        fb_subject = f"Following up - {PRODUCT['name']} for {company}"
+        fb_body = (
             f"Hi {first_name},\n\n"
             f"Just wanted to follow up on my previous message about {PRODUCT['name']}. "
             f"I think it could be a great fit for what {company} is building.\n\n"
@@ -126,8 +135,8 @@ def generate_follow_up_message(lead: dict, step: int, tier: str) -> dict:
             f"Best,\nJoy\nVoco V2 Team"
         )
     elif step == 2:
-        subject = f"{first_name}, one more thought about {company}"
-        body = (
+        fb_subject = f"{first_name}, one more thought about {company}"
+        fb_body = (
             f"Hi {first_name},\n\n"
             f"I know you're busy, so I'll keep this brief. "
             f"Teams similar to {company} have cut their voice feature development time in half "
@@ -136,8 +145,8 @@ def generate_follow_up_message(lead: dict, step: int, tier: str) -> dict:
             f"Best,\nJoy\nVoco V2 Team"
         )
     else:
-        subject = f"Closing the loop - {first_name}"
-        body = (
+        fb_subject = f"Closing the loop - {first_name}"
+        fb_body = (
             f"Hi {first_name},\n\n"
             f"This is my last note on this. I don't want to be a pest.\n\n"
             f"If {PRODUCT['name']} isn't the right fit for {company} right now, "
@@ -146,6 +155,17 @@ def generate_follow_up_message(lead: dict, step: int, tier: str) -> dict:
             f"Best,\nJoy\nVoco V2 Team"
         )
 
+    fallback = f"Subject: {fb_subject}\n\n{fb_body}"
+
+    # LLM generation
+    prompt = build_follow_up_prompt(lead, step, tier)
+    raw = generate_with_fallback(prompt, SYSTEM_FOLLOW_UP, fallback)
+
+    parsed = parse_email_output(raw)
+    subject = parsed["subject"] or fb_subject
+    body = parsed["body"] or fb_body
+
+    logger.debug("Follow-up step %d for %s: LLM=%s", step, lead.get("name"), raw != fallback)
     return {"subject": subject, "body": body}
 
 

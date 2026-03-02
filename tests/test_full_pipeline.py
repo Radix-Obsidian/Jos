@@ -52,16 +52,12 @@ def test_enterprise_lead_full_flow():
     audit = audit_pipeline(state)
     assert len(audit["kpi_entries"]) > 0
 
-    # Close (mocked)
-    with patch("agents.closer_manager.http_requests.post") as mock_post:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {"url": "https://calendly.com/event/xyz"}
-        mock_post.return_value = mock_resp
-        close = close_deal(lead, tier="enterprise")
-        assert close["action"] == "book_demo"
-        assert close["status"] == "booked"
-        assert close["closing_script"] != ""
+    # Close (no mock needed - book_demo now generates link, no API call)
+    close = close_deal(lead, tier="enterprise")
+    assert close["action"] == "book_demo"
+    assert close["status"] == "link_generated"
+    assert close["closing_script"] != ""
+    assert "calendly" in close["url"].lower()
 
 
 def test_self_serve_lead_full_flow():
