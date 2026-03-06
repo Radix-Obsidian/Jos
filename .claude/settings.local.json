@@ -9,7 +9,10 @@
       "Bash(ls:*)",
       "Bash(\"/c/Program Files/nodejs/node.exe\":*)",
       "Bash(powershell.exe:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(curl:*)",
+      "WebSearch",
+      "WebFetch(domain:x.com)"
     ]
   }
 }
