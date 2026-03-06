@@ -15,6 +15,7 @@ import ledger
 from config import (
     PRODUCT, ICP, EMAIL_TEMPLATE, LINKEDIN_TEMPLATE,
     SCORE_ENTERPRISE, SCORE_SELF_SERVE, SCORE_NURTURE, COMPETITORS,
+    PAIN_SIGNALS, PAIN_SIGNAL_BOOST, X_DM_TEMPLATE,
 )
 from llm import (
     generate_with_fallback, build_outreach_prompt,
@@ -234,6 +235,11 @@ def score_lead(lead: dict) -> float:
     sources_list = lead.get("sources_json", [])
     if isinstance(sources_list, list) and len(sources_list) > 1:
         score += 0.05 * min(len(sources_list) - 1, 3)  # cap +0.15
+
+    # Pain signal boost (X/social leads with frustration keywords)
+    context = lead.get("context", "").lower() + " " + lead.get("x_post_text", "").lower()
+    if context.strip() and any(signal in context for signal in PAIN_SIGNALS):
+        score += PAIN_SIGNAL_BOOST
 
     return max(0.0, min(score, 1.0))
 

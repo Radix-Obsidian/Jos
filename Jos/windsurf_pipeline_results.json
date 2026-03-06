@@ -1,0 +1,46 @@
+[
+  {
+    "lead": "Karthik",
+    "x_username": "meTheKarthik",
+    "x_post": "https://x.com/meTheKarthik/status/1944428618089635900",
+    "tier": "enterprise",
+    "score": 0.85,
+    "status": "hot",
+    "channel": "x_dm",
+    "context": "Cancelled Cursor + Windsurf, moved to Claude Code + Cline. Says Cursor hit diminishing returns.",
+    "dm_preview": "Hey Karthik — saw you made the jump to Claude Code + Cline. Smart move. We built Voco as a voice layer on top of Claude Code — lets you talk through code changes instead of typing everything. Cuts the back-and-forth with the agent in half. Since you're already in the Claude ecosystem, might be worth a look: https://itsvoco.com"
+  },
+  {
+    "lead": "Max Weinbach",
+    "x_username": "MaxWinebach",
+    "x_post": "https://x.com/MaxWinebach/status/1960841642270974163",
+    "tier": "self_serve",
+    "score": 0.65,
+    "status": "warm",
+    "channel": "x_dm",
+    "context": "Unsubscribed from Cursor + Windsurf, went to VS Code + Codex. Frustrated by paying for 3+ subscriptions.",
+    "dm_preview": "Hey Max — saw your post about consolidating dev subscriptions. Totally get it. We built Voco as a voice-first coding layer that works with VS Code — no new IDE, no extra subscription on top of what you already have. Just talk to your code. Might solve the \"too many tools\" problem: https://itsvoco.com"
+  },
+  {
+    "lead": "Ivan Fioravanti",
+    "x_username": "ivanfioravanti",
+    "x_post": "https://x.com/ivanfioravanti/status/1942320695968686138",
+    "tier": "self_serve",
+    "score": 0.55,
+    "status": "warm",
+    "channel": "x_dm",
+    "context": "Cancelled Windsurf subscription. Looking for alternatives.",
+    "dm_preview": "Hey Ivan — saw you dropped Windsurf. Curious what you landed on. We're building Voco — voice-powered coding that plugs into whatever IDE you're using now. No lock-in, works with your existing setup. Happy to show you a quick demo if you're interested: https://itsvoco.com"
+  },
+  {
+    "lead": "NomoreID",
+    "x_username": "unknown",
+    "x_post": "https://x.com/i/status/1895090131511791827",
+    "tier": "nurture",
+    "score": 0.40,
+    "status": "warm",
+    "channel": "x_reply",
+    "context": "Cancelled Windsurf. Frustrated that most models fail at tool calling aside from Sonnet.",
+    "dm_preview": "Felt this. Tool calling is broken on most models. We built Voco on top of Claude's Sonnet — the one model that actually works for it. Voice commands that reliably execute. Might be what you were looking for in Windsurf: https://itsvoco.com"
+  }
+]

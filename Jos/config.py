@@ -38,6 +38,15 @@ ICP = {
     ],
 }
 
+# --- Pain Signal Keywords (X/social leads) ---
+# Leads from X who mention these get a score boost even without company/title data
+PAIN_SIGNALS = [
+    "cancelled", "canceled", "unsubscribed", "dropped", "switched from",
+    "moved to", "frustrat", "disappoint", "broken", "doesn't work",
+    "voice coding", "voice command", "tool calling", "diminishing returns",
+]
+PAIN_SIGNAL_BOOST = 0.35  # Enough to push into self_serve tier minimum
+
 # --- Outreach Templates ---
 EMAIL_TEMPLATE = """Subject: {subject}
 
@@ -57,6 +66,13 @@ Voco V2 Team
 LINKEDIN_TEMPLATE = """Hi {first_name},
 
 {opening_line}
+
+{value_prop}
+
+{cta}
+"""
+
+X_DM_TEMPLATE = """Hey {first_name} — {opening_line}
 
 {value_prop}
 
