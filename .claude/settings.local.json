@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where openclaw:*)",
+      "Bash(pip list:*)",
+      "mcp__voco-voice__voco_voice_input",
+      "Bash(openclaw doctor:*)",
+      "Bash(cmd.exe:*)",
+      "Bash(ls:*)",
+      "Bash(\"/c/Program Files/nodejs/node.exe\":*)",
+      "Bash(powershell.exe:*)",
+      "Bash(grep:*)"
+    ]
+  }
+}

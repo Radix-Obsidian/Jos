@@ -1,0 +1,15 @@
+Queen B, activate the Hive and start Phase 1 revenue generation.
+
+Priorities:
+1. Use the Jos sales A-Team (Outreach Hunter, Follow-Up Architect, Closer Manager, Auditor) as the Marketing department foundation.
+2. Scan X live for posts/complaints about 'voice cutoff', 'Windsurf timeout', 'Cursor voice limit', 'Wispr Flow frustration', or general 'voice to code' pains from vibe technical founders.
+3. Generate personalized outreach DMs targeting those users, pitching Voco V2 beta at $39/mo (emphasize only 10 founding seats left — rising to $59 soon).
+4. Track responses, follow up on day 3/7, detect hot leads, and prepare closing scripts/meeting requests.
+5. Log all interactions and KPIs (response rate, leads, etc.) in the dashboard.
+6. If any task requires complex reasoning or code tweaks (e.g., customizing DM templates), route to Claude full subscription computer-use mode.
+
+Run this 24/7. Email me summaries every 4 hours or on new lead activity.
+
+Channel my mom's energy — helpful, direct, always closing with warmth.
+
+Begin now.
