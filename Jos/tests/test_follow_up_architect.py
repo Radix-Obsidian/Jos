@@ -44,10 +44,23 @@ def test_send_email_returns_result():
 
 
 def test_send_email_failure():
-    with patch("agents.follow_up_architect.smtplib.SMTP") as mock_smtp:
+    with patch("agents.follow_up_architect.smtplib.SMTP") as mock_smtp, \
+         patch("agents.follow_up_architect._send_via_gmail_api") as mock_gmail:
         mock_smtp.side_effect = Exception("SMTP failed")
+        mock_gmail.side_effect = Exception("Gmail API failed")
         result = send_email(LEAD, EMAIL_MSG)
         assert result["status"] == "failed"
+
+
+def test_send_email_gmail_api_fallback():
+    """SMTP fails, Gmail API succeeds."""
+    with patch("agents.follow_up_architect.smtplib.SMTP") as mock_smtp, \
+         patch("agents.follow_up_architect._send_via_gmail_api") as mock_gmail:
+        mock_smtp.side_effect = Exception("SMTP failed")
+        mock_gmail.return_value = {"id": "abc123"}
+        result = send_email(LEAD, EMAIL_MSG)
+        assert result["status"] == "sent"
+        assert result["method"] == "gmail_api"
 
 
 def test_send_linkedin_queued():

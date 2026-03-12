@@ -18,6 +18,11 @@ snscrape>=0.7.0
 # Environment variables
 python-dotenv>=1.0.0
 
+# Gmail API (OAuth2 fallback for email sending)
+google-auth>=2.20.0
+google-auth-oauthlib>=1.0.0
+google-api-python-client>=2.90.0
+
 # Web dashboard
 flask>=2.0.0
 

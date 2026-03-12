@@ -2,10 +2,13 @@
 
 Uses local LLM (MLX) for step-aware follow-up generation with template fallback.
 Combines: message sending + follow-up scheduling + tracking.
+Email: tries SMTP first, falls back to Gmail API if SMTP fails.
 """
 from __future__ import annotations
 
+import base64
 import logging
+import os
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -31,34 +34,71 @@ def send_message(lead: dict, message: dict, channel: str = "email") -> dict:
 
 
 def send_email(lead: dict, message: dict) -> dict:
-    """Send email via SMTP."""
-    try:
-        msg = MIMEMultipart()
-        msg["From"] = SMTP["from_email"]
-        msg["To"] = lead["email"]
-        msg["Subject"] = message["subject"]
-        msg.attach(MIMEText(message["body"], "plain"))
+    """Send email via SMTP, falling back to Gmail API if SMTP fails."""
+    msg = MIMEMultipart()
+    msg["From"] = SMTP["from_email"]
+    msg["To"] = lead["email"]
+    msg["Subject"] = message["subject"]
+    msg.attach(MIMEText(message["body"], "plain"))
 
+    smtp_err = None
+
+    # --- Try SMTP first ---
+    try:
         with smtplib.SMTP(SMTP["host"], SMTP["port"]) as server:
             if SMTP.get("username"):
                 server.starttls()
                 server.login(SMTP["username"], SMTP["password"])
             server.send_message(msg)
 
-        ledger.log(f"Email sent to {lead['email']}")
+        ledger.log(f"Email sent to {lead['email']} via SMTP")
         return {
             "status": "sent",
             "channel": "email",
+            "method": "smtp",
             "recipient": lead["email"],
         }
-
     except Exception as e:
-        ledger.log(f"Email failed to {lead.get('email', '?')}: {e}")
+        smtp_err = e
+        logger.warning("SMTP failed for %s: %s — trying Gmail API", lead.get("email"), e)
+
+    # --- Fallback: Gmail API with OAuth2 ---
+    try:
+        _send_via_gmail_api(msg)
+        ledger.log(f"Email sent to {lead['email']} via Gmail API")
+        return {
+            "status": "sent",
+            "channel": "email",
+            "method": "gmail_api",
+            "recipient": lead["email"],
+        }
+    except Exception as api_err:
+        ledger.log(f"Email failed to {lead.get('email', '?')}: SMTP and Gmail API both failed")
         return {
             "status": "failed",
             "channel": "email",
-            "error": str(e),
+            "error": f"SMTP: {smtp_err} | Gmail API: {api_err}",
         }
+
+
+def _send_via_gmail_api(mime_message: MIMEMultipart) -> dict:
+    """Send a MIMEMultipart message using the Gmail API + OAuth2 refresh token."""
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    creds = Credentials(
+        token=None,
+        refresh_token=os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN"),
+        client_id=os.getenv("GOOGLE_OAUTH_CLIENT_ID"),
+        client_secret=os.getenv("GOOGLE_OAUTH_CLIENT_SECRET"),
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+
+    service = build("gmail", "v1", credentials=creds)
+    raw = base64.urlsafe_b64encode(mime_message.as_bytes()).decode()
+    return service.users().messages().send(
+        userId="me", body={"raw": raw}
+    ).execute()
 
 
 def send_linkedin(lead: dict, message: dict) -> dict:
