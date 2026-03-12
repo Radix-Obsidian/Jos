@@ -14,7 +14,7 @@ import ledger
 try:
     import snscrape.modules.twitter as sntwitter
     HAS_SNSCRAPE = True
-except ImportError:
+except (ImportError, AttributeError):
     HAS_SNSCRAPE = False
 
 

@@ -143,12 +143,24 @@ def test_save_kpi_snapshot(db_conn):
 
 # --- Domain Cache ---
 
+def _close_cached_conn(path):
+    """Close and remove the thread-local cached connection for a db path."""
+    from db import _local, _initialized_paths, _init_lock
+    cache = getattr(_local, "connections", {})
+    conn = cache.pop(path, None)
+    if conn:
+        conn.close()
+    with _init_lock:
+        _initialized_paths.discard(path)
+
+
 def test_domain_cache_miss_returns_none():
     """get_domain_cache returns None for an unseen domain."""
     import tempfile, os
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     result = get_domain_cache("notcached.com", db_path=path)
+    _close_cached_conn(path)
     os.unlink(path)
     assert result is None
 
@@ -160,6 +172,7 @@ def test_domain_cache_get_set_roundtrip():
     os.close(fd)
     set_domain_cache("railway.app", "cloud infrastructure", 45, db_path=path)
     result = get_domain_cache("railway.app", db_path=path)
+    _close_cached_conn(path)
     os.unlink(path)
     assert result is not None
     assert result["industry"] == "cloud infrastructure"
@@ -174,6 +187,7 @@ def test_domain_cache_upsert_replaces():
     set_domain_cache("update.io", "saas", 50, db_path=path)
     set_domain_cache("update.io", "developer tools", 120, db_path=path)
     result = get_domain_cache("update.io", db_path=path)
+    _close_cached_conn(path)
     os.unlink(path)
     assert result["industry"] == "developer tools"
     assert result["employees"] == 120

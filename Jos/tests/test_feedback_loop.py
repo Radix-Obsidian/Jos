@@ -23,7 +23,18 @@ def tmp_db():
         _initialized_paths.discard(path)
     conn = get_connection(path)
     yield path
-    os.unlink(path)
+    # Close cached connection before unlinking (Windows needs this)
+    from db import _local
+    cache = getattr(_local, "connections", {})
+    c = cache.pop(path, None)
+    if c:
+        c.close()
+    with _init_lock:
+        _initialized_paths.discard(path)
+    try:
+        os.unlink(path)
+    except PermissionError:
+        pass  # Windows may still hold WAL/SHM files
 
 
 # ---------------------------------------------------------------------------

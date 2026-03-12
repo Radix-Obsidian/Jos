@@ -223,6 +223,7 @@ def test_enrich_lead_no_company(mock_find, mock_verify):
 
 # --- Domain Search ---
 
+@patch("lead_enricher.HUNTER_API_KEY", "fake-key-for-test")
 @patch("lead_enricher.requests.get")
 def test_domain_search_returns_industry_and_size(mock_get):
     """domain_search returns industry and employees from Hunter response."""
@@ -269,6 +270,7 @@ def test_domain_search_skips_when_no_api_key(monkeypatch):
 
 # --- enrich_lead_with_domain ---
 
+@patch("lead_enricher.HUNTER_API_KEY", "fake-key-for-test")
 @patch("lead_enricher.set_domain_cache")
 @patch("lead_enricher.get_domain_cache", return_value=None)
 @patch("lead_enricher.requests.get")

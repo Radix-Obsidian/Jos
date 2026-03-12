@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -137,7 +138,7 @@ def get_next_runs(sched: BackgroundScheduler, n: int = 5) -> list[dict]:
             runs.append({
                 "id": job.id,
                 "name": job.name,
-                "next_run_pt": next_pt.strftime("%a %-I:%M %p PT"),
+                "next_run_pt": next_pt.strftime("%a %#I:%M %p PT") if os.name == "nt" else next_pt.strftime("%a %-I:%M %p PT"),
                 "next_run_iso": next_pt.isoformat(),
             })
     runs.sort(key=lambda x: x["next_run_iso"])
