@@ -1235,6 +1235,11 @@ def api_discover():
         return jsonify({"status": "error", "error": str(e), "count": 0, "sources": 0})
 
 
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "scheduler": scheduler.running})
+
+
 if __name__ == "__main__":
     from config import validate_config
     warnings = validate_config()

@@ -62,6 +62,40 @@ def reset_model():
 
 
 # ---------------------------------------------------------------------------
+# Groq fallback (fast cloud LLM — used when MLX is unavailable e.g. Windows)
+# ---------------------------------------------------------------------------
+
+def _try_groq(prompt: str, system: str, max_tokens: int) -> Optional[str]:
+    """Call Groq llama-3.3-70b-versatile. Returns None on any failure."""
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return None
+    try:
+        import requests  # already in requirements
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.7,
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            text = resp.json()["choices"][0]["message"]["content"].strip()
+            return _post_process(text) or None
+        logger.warning("Groq API returned %s", resp.status_code)
+    except Exception as exc:
+        logger.warning("Groq call failed: %s", exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
 
@@ -118,6 +152,10 @@ def generate_with_fallback(
     result = generate(prompt, system_prompt, max_tokens)
     if result and len(result.strip()) > 20:
         return result
+    # MLX unavailable (e.g. Windows) — try Groq before falling back to template
+    groq_result = _try_groq(prompt, system_prompt, max_tokens or LLM_MAX_TOKENS)
+    if groq_result and len(groq_result.strip()) > 20:
+        return groq_result
     return fallback_text
 
 
